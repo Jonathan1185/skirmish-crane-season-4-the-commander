@@ -42,3 +42,8 @@ Test the connection with:
 ```console
 python -m sandbox llm
 ```
+##Design Goal: My design goal was to make the archer smarter by helping it try to get away from the enemy and make it go close to the footmen. In addition to this the calvalry go into the capture area and once they perish the footmen go then the archers. Additionally I tried making the footmen more focused on protecting the archer while the calvary is still alive.
+
+##Short Reflection: After seeing how to the agent behaves I knew that I also wanted the archer to try and be the smartest out of the three different NPC because it is the lowest health unit. I also wanted the capture area to play a major part of it so I made the calvary job to capture it then the footmen then the archers.
+
+#AI Disclosure and reflection: I used a AI agent (Codex) for my agent to help with the unit behavior and agent navigation.
