@@ -1,97 +1,252 @@
-"""A working Crane starter agent.
+"""Role-based Crane agent with terrain-aware movement.
 
-Each unit runs a separate instance of this class. This starter walks forward until it sees an
-enemy, then takes one legal step toward the nearest visible enemy and names it. Start at the
-``TODO(you)`` comments.
-Read ``environment.md`` beside this file for the rules, helpers, and first improvement. Prepare
-episode state in ``reset``. The constructor takes no arguments.
+Every unit runs its own ``Agent`` instance. Units coordinate from allies and
+enemies they can currently see, while each instance remembers local state.
 """
 
-from sandbox.crane import action, me, tile, visible
+from heapq import heappop, heappush
+
+from sandbox.crane import action, me, paths, tile, units, visible
 from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation
 
 
 class Agent:
-    """Marches toward the enemy side, then steps toward the nearest visible enemy."""
+    """Keeps archers safe, sends cavalry after enemies, and assigns footmen as guards."""
+
+    THREAT_DISTANCE = 3
 
     def reset(self, seed, observation) -> None:
-        # Called once before each match. The opening observation is available here for
-        # precomputation outside the decision clock. This starter stores no state.
-        pass
+        # Each unit has its own Agent instance. A footman can use this history to
+        # notice when a visible archer lost health between its activations.
+        self._archer_health: dict[str, int] = {}
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
-        # The enemies this unit can see.
+        """Choose a role-specific order for this unit."""
+        unit_type = me.unit_type(observation)
+        if unit_type == "archer":
+            return self._archer_order(observation)
+        if unit_type == "cavalry":
+            return self._cavalry_order(observation)
+        return self._footman_order(observation)
+
+    def _archer_order(self, observation: SkirmishObservation) -> SkirmishAction:
+        """Move into arrow range, then kite the closest target at maximum range."""
+        enemies = visible.enemies(observation)
+        footmen = [ally for ally in visible.allies(observation) if ally["type"] == "footman"]
+        if not enemies:
+            return self._move_toward(observation, tile.at_center(observation))
+
+        here = me.position(observation)
+        target = min(enemies, key=lambda enemy: tile.distance(here, enemy["position"]))
+        attack_range = units.STATS["archer"].attack_range
+        attack_paths = [
+            path
+            for path in action.legal_paths(observation)
+            if tile.distance(tile.at_path_end(here, path), target["position"]) <= attack_range
+        ]
+        if not attack_paths:
+            return self._move_toward(observation, target["position"], target["unit_id"])
+
+        # End as far from the target as possible while staying in arrow range.
+        path_id = max(
+            attack_paths,
+            key=lambda path: (
+                tile.distance(tile.at_path_end(here, path), target["position"]),
+                min(
+                    tile.distance(tile.at_path_end(here, path), enemy["position"])
+                    for enemy in enemies
+                ),
+                -min(
+                    (tile.distance(tile.at_path_end(here, path), footman["position"])
+                    for footman in footmen),
+                    default=0,
+                ),
+                len(paths.decode(path)),
+                -path,
+            ),
+        )
+        return action.move(path_id, target["unit_id"], observation)
+
+    def _cavalry_order(self, observation: SkirmishObservation) -> SkirmishAction:
+        """Use a full legal route to close on the nearest visible enemy."""
+        enemies = visible.enemies(observation)
+        if not enemies:
+            return self._move_toward(observation, tile.at_center(observation))
+
+        here = me.position(observation)
+        target = min(enemies, key=lambda enemy: tile.distance(here, enemy["position"]))
+        return self._move_toward(observation, target["position"], target["unit_id"])
+
+    def _footman_order(self, observation: SkirmishObservation) -> SkirmishAction:
+        """Guard visible archers and intercept enemies that threaten them."""
+        archers = [ally for ally in visible.allies(observation) if ally["type"] == "archer"]
         enemies = visible.enemies(observation)
 
-        if not enemies:
-            # At the beginning of a default skirmish match, units sit apart and see no enemies.
-            # me.direction is the digit toward the enemy side, so this unit heads that way.
-            forward = me.direction(observation)
+        if not archers and enemies:
+            here = me.position(observation)
+            target = min(
+                enemies,
+                key=lambda enemy: (enemy["hit_points"], tile.distance(here, enemy["position"])),
+            )
+            return self._move_toward(observation, target["position"], target["unit_id"])
 
-            # legal_steps lists the single steps allowed by the mask. Checking membership keeps
-            # this order legal when a wall, ally, or enemy blocks the way.
-            if forward in action.legal_steps(observation):
-                return action.move(forward)
+        hurt_archers = [
+            archer
+            for archer in archers
+            if archer["unit_id"] in self._archer_health
+            and archer["hit_points"] < self._archer_health[archer["unit_id"]]
+        ]
+        self._archer_health.update({archer["unit_id"]: archer["hit_points"] for archer in archers})
 
-            # TODO(you): this unit stands still when something blocks the way.
-            # It may still attack, but can you choose a better response?
-            return action.stay()
+        threatened_archers = [
+            archer
+            for archer in archers
+            if archer in hurt_archers
+            or any(
+                tile.distance(enemy["position"], archer["position"]) <= self.THREAT_DISTANCE
+                for enemy in enemies
+            )
+        ]
+        threats = [
+            enemy
+            for enemy in enemies
+            if any(
+                archer in hurt_archers
+                or tile.distance(enemy["position"], archer["position"]) <= self.THREAT_DISTANCE
+                for archer in threatened_archers
+            )
+        ]
+        if threats:
+            here = me.position(observation)
+            target = min(
+                threats,
+                key=lambda enemy: (
+                    min(
+                        tile.distance(enemy["position"], archer["position"])
+                        for archer in threatened_archers
+                    ),
+                    tile.distance(here, enemy["position"]),
+                ),
+            )
+            return self._move_toward(observation, target["position"], target["unit_id"])
 
-        # TODO(you): walking toward the nearest enemy is the entire strategy, and it is weak.
-        # An archer should shoot and back away, cavalry should swing wide for a flank, and a
-        # footman should hold the line beside an ally. What should each of your units do?
+        if archers:
+            here = me.position(observation)
+            archer = min(archers, key=lambda ally: tile.distance(here, ally["position"]))
+            return self._move_toward(observation, archer["position"])
 
-        # This unit's current {"q": ..., "r": ...} position.
+        return self._move_toward(observation, tile.at_center(observation))
+
+    def _move_toward(
+        self,
+        observation: SkirmishObservation,
+        goal: AxialPosition,
+        target_id: str | None = None,
+    ) -> SkirmishAction:
+        """Choose the longest legal prefix of a terrain-aware route to ``goal``."""
         here = me.position(observation)
+        path_id = self._pathfind_path(observation, goal)
+        if path_id is None:
+            # A hidden unit can prevent the expected route; replan next activation.
+            path_id = min(
+                action.legal_paths(observation),
+                key=lambda path: (
+                    tile.distance(tile.at_path_end(here, path), goal),
+                    -len(paths.decode(path)),
+                    path,
+                ),
+            )
+        return action.move(path_id, target_id, observation) if target_id else action.move(path_id)
 
-        # The closest enemy in sight. min returns the enemy dictionary, not the distance.
-        nearest = min(enemies, key=lambda enemy: tile.distance(here, enemy["position"]))
+    def _pathfind_path(self, observation: SkirmishObservation, goal: AxialPosition) -> int | None:
+        """Return the longest currently legal prefix of an A* route to ``goal``."""
+        route = self._a_star_route(observation, me.position(observation), goal)
+        if route is None:
+            return None
 
-        # The step that gets closest to the enemy, or 0 when no step gets closer.
-        step = self._step_toward(observation, nearest["position"])
+        legal_paths = set(action.legal_paths(observation))
+        for length in range(min(paths.MAX_STEPS, len(route)), 0, -1):
+            path_id = paths.encode(route[:length])
+            if path_id in legal_paths:
+                return path_id
+        return 0
 
-        # Naming a target makes the strike prefer that enemy. Any visible enemy can be named,
-        # so both orders below are legal.
-        if step == 0:
-            return action.stay(nearest["unit_id"], observation)
-        return action.move(step, nearest["unit_id"], observation)
+    def _a_star_route(
+        self, observation: SkirmishObservation, start: AxialPosition, goal: AxialPosition
+    ) -> tuple[int, ...] | None:
+        """Plan through passable terrain, stopping beside occupied goal tiles."""
+        visible_units = [*visible.allies(observation), *visible.enemies(observation)]
+        occupied = {(unit["position"]["q"], unit["position"]["r"]) for unit in visible_units}
+        start_key = (start["q"], start["r"])
+        goal_key = (goal["q"], goal["r"])
 
-    def _step_toward(self, observation: SkirmishObservation, goal: AxialPosition) -> int:
-        """Return the single step that most closes the gap to goal, or 0 when none does."""
-        # TODO(you): only single steps are tried here. A path can contain four steps, and cavalry
-        # has four movement points, so most of that speed goes to waste.
-        here = me.position(observation)
+        if goal_key in occupied or not self._is_passable(observation, goal):
+            destinations = {
+                (neighbor["q"], neighbor["r"])
+                for neighbor in tile.neighbors(goal).values()
+                if self._is_passable(observation, neighbor)
+                and (neighbor["q"], neighbor["r"]) not in occupied
+            }
+        else:
+            destinations = {goal_key}
+        if not destinations:
+            return None
 
-        # Standing still is path id 0. A step must reduce the distance to be worth taking.
-        best_step = 0
-        best_distance = tile.distance(here, goal)
+        def heuristic(position: tuple[int, int]) -> int:
+            current: AxialPosition = {"q": position[0], "r": position[1]}
+            return min(tile.distance(current, {"q": q, "r": r}) for q, r in destinations)
 
-        for step in action.legal_steps(observation):
-            # at_path_end gives the landing tile, so this is the distance after the step.
-            step_distance = tile.distance(tile.at_path_end(here, step), goal)
+        frontier: list[tuple[int, int, int, tuple[int, int]]] = [
+            (heuristic(start_key), 0, 0, start_key)
+        ]
+        costs = {start_key: 0}
+        previous: dict[tuple[int, int], tuple[tuple[int, int], int]] = {}
+        sequence = 0
 
-            # Remember this step if it is the best one so far.
-            if step_distance < best_distance:
-                best_step, best_distance = step, step_distance
+        while frontier:
+            _, cost_so_far, _, current = heappop(frontier)
+            if cost_so_far != costs.get(current):
+                continue
+            if current in destinations:
+                route: list[int] = []
+                while current != start_key:
+                    current, direction = previous[current]
+                    route.append(direction)
+                return tuple(reversed(route))
 
-        return best_step
+            current_position: AxialPosition = {"q": current[0], "r": current[1]}
+            for direction, neighbor in tile.neighbors(current_position).items():
+                neighbor_key = (neighbor["q"], neighbor["r"])
+                if neighbor_key in occupied or not self._is_passable(observation, neighbor):
+                    continue
+                next_cost = cost_so_far + self._terrain_cost(observation, neighbor)
+                if next_cost >= costs.get(neighbor_key, float("inf")):
+                    continue
+                costs[neighbor_key] = next_cost
+                previous[neighbor_key] = (current, direction)
+                sequence += 1
+                heappush(
+                    frontier,
+                    (next_cost + heuristic(neighbor_key), next_cost, sequence, neighbor_key),
+                )
+        return None
 
-    # Optional: a reinforcement-learning hook called after every step with that step's
-    # transition. Its time counts against the timing and episode budget. The order argument is
-    # what act returned. It is named order so it does not shadow the action helpers.
+    @staticmethod
+    def _is_passable(observation: SkirmishObservation, position: AxialPosition) -> bool:
+        return tile.terrain_at(observation, position)["terrain"] not in {"water", "void"}
+
+    @staticmethod
+    def _terrain_cost(observation: SkirmishObservation, position: AxialPosition) -> int:
+        """Mirror the game's movement-point cost for a passable tile."""
+        ground = tile.terrain_at(observation, position)
+        terrain_cost = 2 if ground["terrain"] == "hill" else 1
+        feature_cost = {"forest": 1, "marsh": 2}.get(ground["feature"], 0)
+        return terrain_cost + feature_cost
+
+    # Optional hooks remain available if you want to add learning or messaging:
     #
     # def learn(self, observation, order: SkirmishAction, reward: float, terminated: bool) -> None:
     #     ...
-
-    # Optional: messaging. Season settings enable it from Season 3 onward. When enabled, chat runs
-    # after a unit chooses its order and receives messages that arrived since its previous
-    # activation. Return each message with a recipient and text. Use None to broadcast to both
-    # sides, or a player id such as "player_2", not a unit id, to send directly to one ally. The
-    # rosters in the observation map each player to its unit. By default, text is limited to 200
-    # characters.
-    # A direct message reaches its allied unit at its next activation, after that unit chooses its
-    # own order. Every message is recorded and shown in replays, so nothing you send is ever secret.
-    # Return nothing to stay silent.
     #
     # def chat(self, inbox: list[dict]) -> list[dict] | None:
     #     ...
